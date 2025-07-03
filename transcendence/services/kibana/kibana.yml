@@ -1,0 +1,28 @@
+server.host: "0.0.0.0"
+server.port: 5601
+server.name: "kibana"
+monitoring.ui.enabled: true
+
+elasticsearch.hosts: [ "https://elasticsearch:9200" ]
+# Without password, nothing shows up at localhost:${KB_PORT} (no gui)
+# For now, store password in kibana-keystore (for sensitive settings)
+elasticsearch.username: "kibana_system"
+# Forbidden to use elastic superuser as it cannot write to system indices that kibana needs to function
+
+elasticsearch.ssl.key: "/certs/kibana.key"
+elasticsearch.ssl.certificate: "/certs/kibana.crt"
+elasticsearch.ssl.certificateAuthorities: "/etc/ssl/certs/ca.crt"
+
+# Need to encrypt traffic between clients and Kibana server as well, as some clients are part
+# of the backend (eg kibana-exporter) even though browser is not
+server.ssl.key: "/certs/kibana.key"
+# Careless mistake, used .key for cert resulting in this strange error:
+# kibana shutting down, Reason: error:0480006C:PEM routines::no start line
+server.ssl.certificate: "/certs/kibana.crt"
+server.ssl.certificateAuthorities: "/etc/ssl/certs/ca.crt"
+server.ssl.enabled: true
+
+# Preinstall elastic integrations which contain ready made kibana dashboards
+xpack.fleet.packages:
+  - name: Hashicorp Vault
+    version: 1.27.0

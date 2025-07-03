@@ -1,0 +1,25 @@
+api.http.host: "0.0.0.0"
+api.ssl.enabled: true
+# api.http.port: 9600-9700
+api.ssl.keystore.path: "/certs/logstash.p12"
+api.ssl.keystore.password: "" #"${LOGSTASH_CERT_PASS}"
+
+# To persist the log data, reference:
+# https://stackoverflow.com/questions/58545087/docker-ship-log-files-being-written-inside-containers-to-elk-stack
+queue:
+  type: persisted
+  drain: true
+
+# The below settings are for monitoring Logstash itself, not for sending what Logstash collected to Elasticsearch
+# Use the Elasticsearch output plugin in pipeline config for that instead
+#xpack.monitoring.enabled: true
+#xpack.monitoring.elasticsearch.hosts: [ "https://elasticsearch:9200" ]
+## Logstash_system user is only meant for setting up legacy collector of logstash monitoring data to Elasticsearch
+#xpack.monitoring.elasticsearch.username: "logstash_system"
+#xpack.monitoring.elasticsearch.password: "${LOGSTASH_PASSWORD}"
+#
+## Logstash unable to decode key without running cmd to convert it in ../../init.sh
+##[ERROR][logstash.licensechecker.licensereader] Unable to retrieve Elasticsearch cluster info. {:message=>"java.security.InvalidKeyException: Unable to decode key", :exception=>Java::JavaSecuritySpec::InvalidKeySpecException}#
+#xpack.monitoring.elasticsearch.ssl.key: "config/certs/logstash/logstash.pkcs8.key"
+#xpack.monitoring.elasticsearch.ssl.certificate: "config/certs/logstash/logstash.crt"
+#xpack.monitoring.elasticsearch.ssl.certificate_authority: "config/certs/ca/ca.crt"

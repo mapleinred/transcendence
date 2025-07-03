@@ -1,0 +1,726 @@
+services:
+  ssl-setup:
+    image: elasticsearch:${STACK_VERSION}
+    configs:
+      - instances.yml
+    volumes:
+      - ./certs:/certs
+      - ./services/ssl-setup/init.sh:/init.sh:ro
+    # Must be root user, else error: NoSuchFileException and Operation not permitted
+    environment:
+      - UID=${UID}
+      - GID=${GID}
+    user: root
+    command: /init.sh
+
+  frontend:
+    build:
+      context: ./services/frontend
+      no_cache: false
+    volumes:
+      - static_volume:/app/public
+      #- ./requirements/node/app/public:/app/public
+    environment:
+      - NODE_ENV=production
+    networks:
+      - game_network
+    #command: sh -c "cp -r /app/public/* /app/public/"
+    #    healthcheck:
+    #      test: ["CMD", "sh", "-c", "ls /app/dist/index.html && ls /app/public/main.ts"]
+    #      interval: 10s
+    #      timeout: 5s
+    #      retries: 3
+
+  node:
+    build:
+      context: ./services/node
+      no_cache: false
+    container_name: node
+    networks:
+      - game_network
+      - monitor-net
+    volumes:
+      #- ./requirements/node:/app
+      - db_volume:/app/db
+      - static_volume:/app/public
+      - ./certs/node:/certs:ro
+      - ./certs/ca/ca.crt:/etc/ssl/certs/ca.crt:ro
+    depends_on:
+      frontend:
+        condition: service_completed_successfully
+      ssl-setup:
+        condition: service_completed_successfully
+    environment:
+      - NODE_ENV=production
+      # To fix Bad Gateway (502): [error] 559#559: *10 SSL_do_handshake() failed (SSL: error:0A000410:SSL routines::ssl/tls alert handshake
+      # failure:SSL alert number 40) while SSL handshaking to upstream
+      - NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca.crt
+    working_dir: /app
+    command: ["node", "index.js"]
+
+  sqlite-exporter:
+    depends_on:
+      - node
+    build:
+      context: ./services/prometheus-exporters/sql-agnostic
+      args:
+        - DB_FILENAME=/db/database.db
+      additional_contexts:
+        - db-exporter=https://github.com/corundex/database_exporter/archive/refs/tags/0.6.8.tar.gz
+    networks:
+      - monitor-net
+    volumes:
+      - db_volume:/db
+    command:
+      - '-config.file'
+      - 'database_exporter.yml'
+      - '-web.listen-address'
+      - ':9285'
+
+  waf: # Reference: https://docs.nginx.com/nginx/admin-guide/security-controls/securing-http-traffic-upstream/
+    depends_on:
+      - grafana
+      - prometheus
+      - vault
+      - kibana
+      - node
+    build:
+      context: services/modsecurity
+      dockerfile_inline: |
+        FROM owasp/modsecurity-crs:4.12.0-nginx-alpine-202503230103
+        USER root
+        RUN apk add --no-cache procps iputils-ping
+        USER nginx
+    networks:
+      - web-net
+      - game_network
+      - monitor-net
+    ports:
+      - 3000-3001:3000-3001 # to grafana, node
+      - 5601:5601 # to kibana
+      - 8200:8200 # to vault
+      - 9090:9090 # to prometheus
+    configs:
+      - source: modsec-setup.conf
+        target: /etc/nginx/templates/modsecurity.d/setup.conf.template
+      - source: modsec-rules.conf
+        target: /etc/nginx/templates/modsecurity.d/rules.conf.template
+      - source: sqli_attacks.conf
+        target: /etc/nginx/templates/modsecurity.d/sqli_attacks.conf.template
+      - source: xss_attacks.conf
+        target: /etc/nginx/templates/modsecurity.d/xss_attacks.conf.template
+      - source: default.conf # rubbish file
+        target: /etc/nginx/templates/conf.d/default.conf.template
+      - source: backend_servers.conf
+        target: /etc/nginx/templates/conf.d/backend_servers.conf.template
+    volumes:
+      - ./certs/waf:/certs:ro
+      - ./certs/ca/ca.crt:/etc/ssl/certs/ca.crt:ro
+      - static_volume:/usr/share/nginx/html:ro
+    environment:
+      #- DNS_SERVER=127.0.0.11 # Used to resolve names of upstream servers into addresses
+      # Modsec runs with an unprivileged user, can't use ports below 1024
+      - SSL_CERT=/certs/waf.crt
+      - SSL_CERT_KEY=/certs/waf.key
+      - PROXY_SSL_CERT=/certs/waf.crt
+      - PROXY_SSL_CERT_KEY=/certs/waf.key
+      - MODSEC_AUDIT_LOG=/dev/stdout
+        #- MODSEC_AUDIT_LOG_FORMAT=JSON
+    logging:
+      driver: gelf
+      options:
+        tag: waf
+        gelf-address: udp://localhost:12200
+          #gelf-compression-type: none # default is gzip, which leads to excessive CPU usage
+          #gelf-compression-level: -1
+    healthcheck:
+      test: curl --cacert /etc/ssl/certs/ca.crt https://waf:3000
+      interval: 2s
+      timeout: 3s
+      retries: 5
+
+  nginx-exporter:
+    depends_on:
+      waf:
+        condition: service_healthy
+    image: nginx/nginx-prometheus-exporter:1.4
+    networks:
+      - monitor-net
+    volumes:
+      - ./certs/prom-exporter:/certs:ro
+      - ./certs/ca/ca.crt:/etc/ssl/certs/ca.crt:ro
+    configs:
+      - tls-config-exporter.yml
+    command:
+      - --nginx.scrape-uri=https://waf:10000/basic_status
+      - --web.listen-address=:9113
+      - --web.config.file=/tls-config-exporter.yml
+      - --nginx.ssl-verify
+      - --nginx.ssl-ca-cert=/etc/ssl/certs/ca.crt
+      - --nginx.ssl-client-cert=/certs/prom-exporter.crt
+      - --nginx.ssl-client-key=/certs/prom-exporter.key
+
+  prometheus:
+    depends_on:
+      ssl-setup:
+        condition: service_completed_successfully
+    image: prom/prometheus:v3.2.1
+    networks: # listens on port 9090
+      - web-net
+      - monitor-net
+    # Allows prometheus container to access host port for node-exporter, who will be on host network driver
+    # - no ip address allocated to it and it's network stack is not isolated from the docker host
+    user: root
+    extra_hosts:
+      - 'host.docker.internal:host-gateway'
+    volumes:
+      - prom-data:/prometheus
+      # For some reason prometheus searches for ssl certs starting from /etc/prometheus directory
+      - ./certs/prometheus:/certs:ro
+      - ./certs/ca/ca.crt:/etc/ssl/certs/ca.crt:ro
+    configs:
+      - tls-config-prom.yml
+      - alerting_rules.yml
+      - prometheus.yml
+    secrets:
+      - prometheus-token
+    environment:
+      - VAULT_ADDR=${VAULT_ADDR}
+    command:
+      - '--config.file=/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--storage.tsdb.retention.time=1d' # How long to retain samples in storage, default 15d
+      - '--storage.tsdb.retention.size=512MB'
+      - '--web.config.file=/tls-config-prom.yml'
+
+  # Note: running cadvisor in Rootless Docker will need to change some settings
+  # /var/run/docker.sock (owned by root:docker) => /run/user/$(id -u)/docker.sock (owned by $UID:$GID)
+  # /var/lib/docker => $HOME/.local/share/docker
+  # /sys => /sys/fs/cgroup
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:latest
+    networks:
+      - monitor-net # listens on port 8080
+    #ports:
+    #  - 8080:8080
+    user: root
+    privileged: true
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - ${HOME}/.local/share/docker:/var/lib/docker:ro
+      - /run/user/${UID}/docker.sock:/var/run/docker.sock:ro
+      - /dev/disk:/dev/disk:ro
+      #- ./certs/prom-exporter:/certs:ro
+      #- ./certs/ca/ca.crt:/etc/ssl/certs/ca.crt
+    devices:
+      - /dev/kmsg:/dev/kmsg:ro
+
+  #  blackbox:
+  #    depends_on:
+  #      elastic-setup:
+  #        condition: service_healthy
+  #    image: prom/blackbox-exporter:v0.26.0
+  #    networks:
+  #      - monitor-net
+  #    ports:
+  #      - 9115:9115
+  #    configs:
+  #      - tls-config-exporter.yml
+  #      - blackbox.yml
+  #    volumes:
+  #      - ./certs/prom-exporter:/certs:ro
+  #      - ./certs/ca/ca.crt:/etc/ssl/certs/ca.crt:ro
+  #    command:
+  #      - '--config.file=/blackbox.yml'
+  #      - '--web.config.file=/tls-config-exporter.yml'
+
+  node-exporter:
+    depends_on:
+      ssl-setup:
+        condition: service_completed_successfully
+    image: prom/node-exporter:v1.9.0
+    network_mode: host # listens on port 9101
+    pid: host
+    restart: unless-stopped
+    configs:
+      - tls-config-exporter.yml
+    volumes:
+      - /:/rootfs:ro
+      - /sys:/host/sys:ro
+      - /proc:/host/proc:ro
+      - ./certs/prom-exporter:/certs:ro
+      - ./certs/ca/ca.crt:/etc/ssl/certs/ca.crt:ro
+      - /run/dbus/system_bus_socket:/var/run/dbus/system_bus_socket:ro
+    command:
+      - '--path.rootfs=/rootfs'
+      - '--path.sysfs=/host/sys'
+      - '--path.procfs=/host/proc'
+      - '--path.udev.data=/rootfs/run/udev/data'
+      - '--web.config.file=/tls-config-exporter.yml'
+      - '--web.listen-address=:9101'
+      - '--collector.tcpstat'
+      # To collect systemd metrics, user must be root and /run/dbus/system_bus_socket must be mounted, else certain errors could appear
+      # - no such file or directory, unix->@/run/dbus/system_bus_socket recv msg / EOF
+      - '--collector.systemd'
+      - '--collector.processes'
+      - '--collector.interrupts'
+    privileged: true
+    user: root
+    # run with additional path.udev.data flag to resolve this error
+    # level=ERROR source=diskstats_linux.go:264 msg="Failed to open directory, disabling udev device properties" collector=diskstats path=/run/udev/data
+
+  # Note: both vault and vault-setup must have the same UID:GID as host user, else 
+  # error: mkdir /vault/data/core will pop up in vault-setup even though it has valid
+  # permissions, if vault container doesn't have perms due to UID:GID mismatch.
+  # Also, can't use docker volumes as they are owned by root user, only bind mounts
+
+  # If Elastic-setup container isn't configured properly (ie not guaranteed that container 
+  # can live longer than healthcheck pass), causes tls cert not found error by vault server
+  # Note: ssl-setup -> service_completed_successfully should resolve root cause of error
+  vault:
+    depends_on:
+      ssl-setup:
+        condition: service_completed_successfully
+    build: services/vault
+    networks:
+      - web-net
+      - vault-net
+      - monitor-net
+#    ports:
+#      - 8200:8200
+    # User has to be root for the cap_add directive, else error:
+    # unable to set CAP_SETFCAP effective capability: Operation not permitted
+    user: root
+    working_dir: /vault
+    cap_add:
+      - IPC_LOCK
+    configs:
+      - source: vault.hcl
+        target: /vault/config/vault.hcl
+    volumes:
+      - vault-storage:/vault/file
+      - ./certs/vault:/certs:ro
+      - ./certs/ca/ca.crt:/etc/ssl/certs/ca.crt:ro
+    environment:
+      - VAULT_ADDR=${VAULT_ADDR}
+      - VAULT_CACERT=/etc/ssl/certs/ca.crt
+      - VAULT_CLIENT_CERT=/certs/vault.crt
+      - VAULT_CLIENT_KEY=/certs/vault.key
+    command:
+      - server
+    healthcheck:
+      test: curl -k https://vault:8200/v1/sys/seal-status
+      interval: 2s
+      timeout: 5s
+      retries: 30
+    logging:
+      driver: gelf
+      options:
+        tag: vault
+        gelf-address: udp://localhost:12204
+          #gelf-compression-type: none
+          #gelf-compression-level: -1
+  
+  vault-setup:
+    depends_on:
+      vault:
+        condition: service_healthy
+    build: services/vault
+    networks:
+      - vault-net
+    volumes:
+      - vault-storage:/vault/file
+      - ./secrets:/vault/secrets
+      # Add ca cert at /etc/ssl/certs (OS truststore) which will be used to verify
+      # ssl certs that servers will send to clients during https connection
+      - ./certs/vault:/certs:ro
+      - ./certs/ca/ca.crt:/etc/ssl/certs/ca.crt:ro
+    environment:
+      - ELASTIC_PASSWORD=${ELASTIC_PASSWORD}
+      - KIBANA_PASSWORD=${KIBANA_PASSWORD}
+      - LOGSTASH_PASSWORD=${LOGSTASH_PASSWORD}
+      - GRAFANA_PASSWORD=${GRAFANA_PASSWORD}
+      - GF_ACC_USER=${GF_ACC_USER}
+      - GF_ACC_PASS=${GF_ACC_PASS}
+      - ELK_ACC_USER=${ELK_ACC_USER}
+      - ELK_ACC_PASS=${ELK_ACC_PASS}
+      - VAULT_ADDR=${VAULT_ADDR}
+    # Needs root priviledges to write to files in secrets folder
+    user: root
+    command: ./init.sh
+    # init.sh will insert a space after the equal sign before 'secret_key' and 'token',
+    # which will signal whether it's done inserting token plus enc-key into grafana.ini
+    #    healthcheck:
+    #      test: /bin/bash -c 'sleep 10 && (grep "^token = " /vault/grafana.ini); test $? -eq 0'
+
+  logstash-exporter:
+    depends_on:
+      logstash:
+        condition: service_healthy
+    # v2 uses /app/config.yml, v1 uses .env file for config values
+    image: kuskoman/logstash-exporter:v2.0.0-pre11 #1.9.0
+    networks: # listens on port 9198
+      - monitor-net
+    configs:
+      - source: logstash-exporter.yml
+        target: /app/config.yml
+    volumes:
+      - ./certs/prom-exporter:/certs:ro
+      - ./certs/ca/ca.crt:/etc/ssl/certs/ca.crt:ro
+
+  # This exporter can only listen on HTTP, but uses HTTPS when communicating with ES cluster
+  # Trying to connect to this server via HTTPS from Prometheus will result in this error
+  # with curl: (35) error::SSL routines:ssl3_get_record:wrong version number
+  elasticsearch-exporter:
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    build:
+      context: services/prometheus-exporters
+      additional_contexts:
+        - json-parser=https://github.com/step-/JSON.awk.git
+      dockerfile_inline: |
+        # Between v1.7.0 - v1.9.0, wget in busybox (for certain versions - eg BusyBox v1.36.1 (2023-12-04 19:44:32 UTC) multi-call binary)
+        # result in this error:
+        # wget: TLS error from peer (alert code 40): handshake failure
+        # wget: error getting response: Connection reset by peer
+        FROM prometheuscommunity/elasticsearch-exporter:v1.6.0
+        COPY --from=json-parser JSON.awk /JSON.awk
+        USER root
+        RUN --mount=type=bind,from=json-parser,target=/json /json/tool/patch-for-busybox-awk.sh
+    networks:
+      - monitor-net # listens on port 9114
+#    ports:
+#      - 127.0.0.1:9114:9114
+    volumes:
+      - ./certs/prom-exporter:/certs:ro
+      - ./certs/ca/ca.crt:/etc/ssl/certs/ca.crt:ro
+      - ./services/prometheus-exporters/es-exporter.sh:/es-exporter.sh:ro
+    secrets:
+      - elastic-token
+    environment:
+      - VAULT_ADDR=${VAULT_ADDR}
+    entrypoint: /es-exporter.sh
+
+  kibana-exporter:
+    depends_on:
+      - kibana
+    build:
+      context: services/prometheus-exporters
+      additional_contexts:
+        - json-parser=https://github.com/step-/JSON.awk.git
+      dockerfile_inline: |
+        FROM chamilad/kibana-prometheus-exporter:v8.7.x.2
+        COPY --from=json-parser JSON.awk /JSON.awk
+        # need to run this script below for busybox, else using awk -f JSON.awk will result in error - awk: bad regex '^﻿|"[^"\\': Unmatched [ or [^
+        RUN --mount=type=bind,from=json-parser,target=/json /json/tool/patch-for-busybox-awk.sh
+    networks:
+      - monitor-net # listens on port 9684
+      - vault-net
+    volumes:
+      - ./certs/ca/ca.crt:/etc/ssl/certs/ca.crt:ro
+      - ./services/prometheus-exporters/kb-exporter.sh:/kb-exporter.sh:ro
+    secrets:
+      - elastic-token
+    environment:
+      - VAULT_ADDR=${VAULT_ADDR}
+    entrypoint: /kb-exporter.sh
+    stop_signal: SIGKILL
+
+  # Reference:
+  # https://grafana.com/docs/grafana/latest/setup-grafana/configure-security/configure-database-encryption/integrate-with-hashicorp-vault/
+  # https://www.elastic.co/guide/en/integrations/current/hashicorp_vault.html#hashicorp_vault-audit-logs
+  # https://developer.hashicorp.com/vault/docs/secrets/databases/elasticdb
+  grafana:
+    depends_on:
+      prometheus:
+        condition: service_started
+      #- blackbox
+      cadvisor:
+        condition: service_started
+      node-exporter:
+        condition: service_started
+      elasticsearch-exporter:
+        condition: service_started
+      vault-setup:
+        condition: service_completed_successfully
+      logstash:
+        condition: service_healthy
+    build:
+      context: services/grafana
+      additional_contexts:
+        - nginx-exporter=https://github.com/nginx/nginx-prometheus-exporter.git
+    networks:
+      - web-net
+      - monitor-net
+#    ports:
+#      - 3000:3000
+    configs:
+      - source: prom-datasource.yml
+        target: /etc/grafana/provisioning/datasources/prom-datasource.yml
+      - source: grafana.ini
+        target: /etc/grafana/grafana.ini
+      - source: dashboard.yml
+        target: /etc/grafana/provisioning/dashboards/dashboard.yml
+    volumes:
+      - grafana-storage:/var/lib/grafana
+      - ./certs/prom-exporter:/certs:ro
+      - ./services/grafana/run.sh:/run.sh:ro
+      - ./services/grafana/init.sh:/init.sh:ro
+      - ./certs/ca/ca.crt:/etc/ssl/certs/ca.crt:ro
+    secrets:
+      - grafana-token
+    environment:
+      - GF_INSTALL_PLUGINS=grafana-clock-panel,grafana-polystat-panel
+      - VAULT_ADDR=${VAULT_ADDR}
+      #- GF_SERVER_ROOT_URL=http://my.grafana.server/
+    user: root
+    logging:
+      driver: gelf
+      options:
+        tag: grafana
+        gelf-address: udp://localhost:12201
+          #gelf-compression-type: none
+          #gelf-compression-level: -1
+
+  elastic-setup:
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    build:
+      context: services/elasticsearch
+      args:
+        - STACK_VERSION=${STACK_VERSION}
+    networks:
+      - vault-net
+      - elastic-net
+    volumes:
+      - ./certs/ca/ca.crt:/etc/ssl/certs/ca.crt:ro
+      - ./services/elastic-setup/init.sh:/usr/share/elasticsearch/init.sh:ro
+    secrets:
+      - elastic-token
+    environment:
+      - VAULT_ADDR=${VAULT_ADDR}
+    command: /bin/bash -c "./init.sh 2>&1"
+
+  # Both logstash and kibana needs elasticsearch to be up first
+  # using gelf logging driver on TCP seems to fail silently (no logs appear in kibana ui),
+  # probably because gelf driver doesn't support TLS for TCP connections - messages sent
+  # to TLS-protected inputs can silently fail
+  logstash:
+    depends_on:
+      ssl-setup:
+        condition: service_completed_successfully
+      vault-setup:
+        condition: service_completed_successfully
+    build:
+      context: services/logstash
+      dockerfile_inline: |
+        FROM logstash:${STACK_VERSION}
+        USER root
+        RUN apt-get update && apt-get upgrade -y && apt-get install net-tools jq -y && apt-get clean
+        USER logstash
+    networks:
+      - vault-net
+      - monitor-net
+      - elastic-net
+    ports:
+      - 127.0.0.1:12200-12205:12200-12205/udp
+    configs:
+      - source: pipelines.yml
+        target: /usr/share/logstash/config/pipelines.yml
+      - source: logstash.yml
+        target: /usr/share/logstash/config/logstash.yml
+    volumes:
+      - ./certs/logstash:/certs:ro
+      - ./certs/ca/ca.crt:/etc/ssl/certs/ca.crt:ro
+      - ./services/logstash/pipeline:/usr/share/logstash/pipeline:ro # Pipeline configs
+      - ./services/logstash/docker-entrypoint:/usr/local/bin/docker-entrypoint:ro
+      - logstash-storage:/usr/share/logstash/data
+    secrets:
+      - logstash-token
+    environment:
+      - VAULT_ADDR=${VAULT_ADDR}
+    # Needs root privileges for this - ArgumentError: API Keystore could not be opened (/certs/logstash.p12 (Permission denied))
+    user: root
+    restart: on-failure # rare case: all pipelines fail because of InvalidKeySpecException even though .pkcs8 non-private format is used
+    logging:
+      driver: gelf
+      options:
+        tag: logstash
+        gelf-address: udp://localhost:12205
+          #gelf-compression-type: none
+          #gelf-compression-level: -1
+    healthcheck:
+      test: curl -s --cacert /etc/ssl/certs/ca.crt https://logstash:9600
+      timeout: 3s
+      interval: 2s
+      retries: 30
+
+  elasticsearch:
+    depends_on:
+      vault-setup:
+        condition: service_completed_successfully
+      logstash:
+        condition: service_healthy
+    build:
+      context: services/elasticsearch
+      args:
+        - STACK_VERSION=${STACK_VERSION}
+    networks:
+      - monitor-net
+      - elastic-net
+    configs:
+      - source: elasticsearch.yml
+        target: /usr/share/elasticsearch/config/elasticsearch.yml
+      - source: heap.options
+        target: /usr/share/elasticsearch/config/jvm.options.d/heap.options
+    volumes:
+      # SSL Resources must be placed specifically in this folder below because of this error:
+      # [xpack.security.transport.ssl] - cannot read configured PEM certificate_authorities [/etc/ssl/certs/ca.crt] because access to read the file is blocked; SSL resources should be placed in the [/usr/share/elasticsearch/config] directory
+      - elastic-storage:/usr/share/elasticsearch/data
+      - ./certs:/usr/share/elasticsearch/config/certs:ro
+      - ./services/elasticsearch/docker-entrypoint.sh:/usr/local/bin/docker-entrypoint.sh
+    secrets:
+      - elastic-token
+    environment:
+      - discovery.type=single-node
+      - VAULT_ADDR=${VAULT_ADDR}
+      # If password not set, we won't be able to log into elasticsearch cluster with elastic user
+      # Logstash Error: unable to authenticate user [elastic] for REST request
+    logging:
+      driver: gelf
+      options:
+        tag: elasticsearch
+        gelf-address: udp://localhost:12203
+    healthcheck:
+      #test: curl --fail -s http://elasticsearch:9200/_cluster/health?wait_for_status=green&timeout=5s || exit 1
+      test: curl -s --cacert config/certs/ca/ca.crt https://elasticsearch:9200
+      interval: 1s
+      timeout: 2s
+      retries: 100
+
+  kibana:
+    depends_on:
+      #elastic-setup:
+      #  condition: service_completed_successfully
+      logstash:
+        condition: service_healthy
+    build:
+      context: services/kibana
+      #args:
+      #  - STACK_VERSION=${STACK_VERSION}
+      # for dockerfile_inline, variable expansion will happen from compose file - ignores ARG values
+      dockerfile_inline: |
+        #ARG STACK_VERSION
+        FROM kibana:${STACK_VERSION}
+        USER root
+        RUN apt-get update && apt-get upgrade -y && apt-get install jq -y && apt-get clean
+        USER kibana
+    networks:
+      - web-net
+      - monitor-net
+      - elastic-net
+#    ports:
+#      - 5601:5601
+    configs:
+      - source: kibana.yml
+        target: /usr/share/kibana/config/kibana.yml
+    volumes:
+      - ./certs/kibana:/certs:ro
+      - ./certs/ca/ca.crt:/etc/ssl/certs/ca.crt:ro
+      # Create kibana keystore (for sensitive settings) and store elasticsearch password in it
+      # Password used to connect to elasticsearch cluster, else error: security exception,
+      # missing authentication credentials for REST request
+      - ./services/kibana/kibana-docker:/usr/local/bin/kibana-docker
+    secrets:
+      - kibana-token
+    environment:
+      - VAULT_ADDR=${VAULT_ADDR}
+    logging:
+      driver: gelf
+      options:
+        tag: kibana
+        gelf-address: udp://localhost:12202
+          #gelf-compression-type: none
+          #gelf-compression-level: -1
+
+networks:
+  web-net:
+  monitor-net:
+  vault-net:
+  elastic-net:
+  game_network:
+
+# Note: cannot set writable bit for docker configs (world-readable 0444 by default)
+configs:
+  instances.yml:
+    file: ./services/ssl-setup/instances.yml
+  modsec-setup.conf:
+    file: ./services/modsecurity/setup.conf
+  modsec-rules.conf:
+    file: ./services/modsecurity/rules.conf
+  sqli_attacks.conf:
+    file: ./services/modsecurity/sqli_attacks.conf
+  xss_attacks.conf:
+    file: ./services/modsecurity/xss_attacks.conf
+  default.conf:
+    file: ./services/modsecurity/default.conf
+  backend_servers.conf:
+    file: ./services/modsecurity/backend_servers.conf
+  prometheus.yml:
+    file: ./services/prometheus/prometheus.yml
+  alerting_rules.yml:
+    file: ./services/prometheus/alerting_rules.yml
+  blackbox.yml:
+    file: ./services/prometheus-exporters/blackbox.yml
+  prom-datasource.yml:
+    file: ./services/grafana/prom-datasource.yml
+  grafana.ini:
+    file: ./services/grafana/grafana.ini # lines 32, 70-71, 171, 1572
+  dashboard.yml:
+    file: ./services/grafana/dashboard.yml
+  vault.hcl:
+    file: ./services/vault/vault.hcl
+  tls-config-exporter.yml: # Run prometheus exporters with --web.config.file flag
+    file: ./services/prometheus-exporters/tls-config-exporter.yml
+  tls-config-prom.yml: # Run prometheus with --web.config.file flag
+    file: ./services/prometheus-exporters/tls-config-prom.yml
+  logstash-exporter.yml:
+    file: ./services/prometheus-exporters/logstash-exporter.yml
+  pipelines.yml:
+    file: ./services/logstash/pipelines.yml
+  logstash.yml:
+    file: ./services/logstash/logstash.yml
+  elasticsearch.yml:
+    file: ./services/elasticsearch/elasticsearch.yml
+  heap.options:
+    # Recommended to allocate no more than 50% of total RAM to elasticsearch
+    content: |
+      -Xms${HEAP_SIZE}
+      -Xmx${HEAP_SIZE}
+  kibana.yml:
+    file: ./services/kibana/kibana.yml
+
+volumes:
+  prom-data:
+  grafana-storage:
+  vault-storage:
+  logstash-storage:
+  elastic-storage:
+  static_volume:
+  db_volume:
+
+secrets:
+  prometheus-token:
+    file: ./secrets/prometheus-token
+  grafana-token:
+    file: ./secrets/grafana-token
+  logstash-token:
+    file: ./secrets/logstash-token
+  elastic-token:
+    file: ./secrets/elastic-token
+  kibana-token:
+    file: ./secrets/kibana-token

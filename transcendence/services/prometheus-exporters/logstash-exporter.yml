@@ -1,0 +1,16 @@
+logstash:
+  instances:
+    - url: "https://logstash:9600"
+      tls_config:
+        cert_file: "/certs/prom-exporter.crt"
+        key_file: "/certs/prom-exporter.key"
+        ca_file: "/etc/ssl/certs/ca.crt"
+  timeout: 2s
+
+server:
+  host: "0.0.0.0"
+  port: 9198
+  tls_server_config:
+    cert_file: "/certs/prom-exporter.crt"
+    key_file: "/certs/prom-exporter.key"
+    ca_file: "/etc/ssl/certs/ca.crt"

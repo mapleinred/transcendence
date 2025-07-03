@@ -1,0 +1,109 @@
+FROM golang:1.24-bookworm
+ADD https://github.com/corundex/database_exporter.git .
+ENV CGO_ENABLED="1" CGO_CFLAGS="-D_LARGEFILE64_SOURCE"
+# Note: gcc alone will not download library headers eg stdlib.h (for apk), need musl-dev package as well
+#RUN apk add --no-cache gcc musl-dev py3-pkgconfig && \
+#    go get github.com/Corundex/database_exporter/cmd/database_exporter && \
+#    go install github.com/Corundex/database_exporter/cmd/database_exporter
+ADD https://download.oracle.com/otn_software/linux/instantclient/2370000/instantclient-basic-linux.x64-23.7.0.25.01.zip \
+    /opt/oracle/instantclient_23_7.zip
+#ENV LD_LIBRARY_PATH=/opt/oracle/instantclient_23_7:${LD_LIBRARY_PATH}
+#musl-dev 
+
+ENV LD_LIBRARY_PATH=/opt/oracle/instantclient_23_7
+ENV PKG_CONFIG_PATH='/go/pkg/mod/github.com/!corundex/database_exporter@v0.6.4/include'
+RUN apt-get update && \
+apt-get upgrade -y && \
+apt-get install gcc zip libaio1 pkg-config -y && \
+apt-get clean && \
+go get github.com/mattn/go-oci8 && \
+go get github.com/Corundex/database_exporter/cmd/database_exporter
+#go install github.com/Corundex/database_exporter/cmd/database_exporter
+
+#cd /opt/oracle && \
+#unzip instantclient_23_7 && \
+#echo /opt/oracle/instantclient_23_7 > /etc/ld.so.conf.d/oracle-instantclient.conf && \
+#ldconfig && \
+#cd /go && \
+##RUN <<EOF
+#apt-get update
+#apt-get upgrade -y
+#apt-get install gcc unzip libaio pkg-config
+#apt-get clean
+#cd /opt/oracle
+#unzip instantclient_23_7.zip
+#echo /opt/oracle/instantclient_23_7 > /etc/ld.so.conf.d/oracle-instantclient.conf
+#ldconfig
+#export LD_LIBRARY_PATH=/opt/oracle/instantclient_23_7:$LD_LIBRARY_PATH
+#cd /go
+#go get github.com/mattn/go-oci8
+#go get github.com/Corundex/database_exporter/cmd/database_exporter
+#EOF
+
+#go get github.com/Corundex/database_exporter/cmd/database_exporter
+#go install github.com/Corundex/database_exporter/cmd/database_exporter
+#RUN apt-get update && apt-get upgrade -y && apt-get install -y gcc musl-dev pkg-config && \
+#   cd /opt/oracle && unzip instantclient-basic-linux.x64-23.7.0.25.01.zip
+#&& apt-get clean && \
+#    go get github.com/Corundex/database_exporter/cmd/database_exporter && \
+#    go install github.com/Corundex/database_exporter/cmd/database_exporter
+CMD ["./database_exporter"]
+#ENTRYPOINT ["sleep", "infinity"]
+
+# 1) Need to export this variable to environment, setting as build arg eg CGO_ENABLED="1" go get ... doesn't do anything
+# CGO_ENABLED="1" Env var resolves this error: 
+# 3.434 # github.com/mattn/go-oci8
+# 3.434 pkg/mod/github.com/mattn/go-oci8@v0.1.1/connector.go:14:10: undefined: Connector
+# 3.434 pkg/mod/github.com/mattn/go-oci8@v0.1.1/connector.go:20:18: undefined: Connector
+# 3.434 pkg/mod/github.com/mattn/go-oci8@v0.1.1/connector.go:21:9: undefined: Driver
+# 3.434 pkg/mod/github.com/mattn/go-oci8@v0.1.1/connector.go:25:18: undefined: Connector
+# 3.434 pkg/mod/github.com/mattn/go-oci8@v0.1.1/connector.go:30:11: undefined: Conn
+# But have different error: 
+# 2.097 # runtime/cgo
+# 2.097 cgo: C compiler "gcc" not found: exec: "gcc": executable file not found in $PATH
+
+# 2) CGO_CFLAGS="-D..." Env var resolves this error:
+# 8.607 # github.com/mattn/go-sqlite3
+# 8.607 sqlite3-binding.c:38268:42: error: 'pread64' undeclared here (not in a function); did you mean 'pread'?
+# 8.607 38268 |   { "pread64",      (sqlite3_syscall_ptr)pread64,    0  },
+# 8.607       |                                          ^~~~~~~
+# 8.607       |                                          pread
+# 8.607 sqlite3-binding.c:38286:42: error: 'pwrite64' undeclared here (not in a function); did you mean 'pwrite'?
+# 8.607 38286 |   { "pwrite64",     (sqlite3_syscall_ptr)pwrite64,   0  },
+# 8.607       |                                          ^~~~~~~~
+# 8.607       |                                          pwrite
+# 8.607 sqlite3-binding.c: In function 'seekAndRead':
+# 8.607 sqlite3-binding.c:38272:49: error: unknown type name 'off64_t'; did you mean 'off_t'?
+# 8.607 38272 | #define osPread64 ((ssize_t(*)(int,void*,size_t,off64_t))aSyscall[10].pCurrent)
+# 8.607       |                                                 ^~~~~~~
+# 8.607 sqlite3-binding.c:41128:11: note: in expansion of macro 'osPread64'
+# 8.607 41128 |     got = osPread64(id->h, pBuf, cnt, offset);
+# 8.607       |           ^~~~~~~~~
+# 8.607 sqlite3-binding.c:38272:58: error: expected ')' before 'aSyscall'
+# 8.607 38272 | #define osPread64 ((ssize_t(*)(int,void*,size_t,off64_t))aSyscall[10].pCurrent)
+# 8.607       |                   ~                                      ^~~~~~~~
+# 8.607 sqlite3-binding.c:41128:11: note: in expansion of macro 'osPread64'
+# 8.607 41128 |     got = osPread64(id->h, pBuf, cnt, offset);
+# 8.607       |           ^~~~~~~~~
+# 8.607 sqlite3-binding.c: In function 'seekAndWriteFd':
+# 8.607 sqlite3-binding.c:38290:57: error: unknown type name 'off64_t'; did you mean 'off_t'?
+# 8.607 38290 | #define osPwrite64  ((ssize_t(*)(int,const void*,size_t,off64_t))\
+# 8.607       |                                                         ^~~~~~~
+# 8.607 sqlite3-binding.c:41257:17: note: in expansion of macro 'osPwrite64'
+# 8.607 41257 |   do{ rc = (int)osPwrite64(fd, pBuf, nBuf, iOff);}while( rc<0 && errno==EINTR);
+# 8.607       |                 ^~~~~~~~~~
+# 8.607 sqlite3-binding.c:38291:21: error: expected ')' before 'aSyscall'
+# 8.607 38291 |                     aSyscall[13].pCurrent)
+# 8.607       |                     ^~~~~~~~
+# 8.607 sqlite3-binding.c:41257:17: note: in expansion of macro 'osPwrite64'
+# 8.607 41257 |   do{ rc = (int)osPwrite64(fd, pBuf, nBuf, iOff);}while( rc<0 && errno==EINTR);
+# 8.607       |                 ^~~~~~~~~~
+# 8.607 sqlite3-binding.c:38290:21: note: to match this '('
+# 8.607 38290 | #define osPwrite64  ((ssize_t(*)(int,const void*,size_t,off64_t))\
+# 8.607       |                     ^
+# 8.607 sqlite3-binding.c:41257:17: note: in expansion of macro 'osPwrite64'
+# 8.607 41257 |   do{ rc = (int)osPwrite64(fd, pBuf, nBuf, iOff);}while( rc<0 && errno==EINTR);
+# 8.607       |                 ^~~~~~~~~~
+
+# 3) installing py3-pkgconfig apk package for pkg-config cli tool for this error:
+# 4.872 github.com/mattn/go-oci8: exec: "pkg-config": executable file not found in $PATH
