@@ -1,0 +1,39 @@
+#Values in dns fields will be added as Subject Alternative Names for this
+#error when vault-setup container tries to communicate with vault container
+#Error looking up token: Get "https://vault:8200/v1/auth/token/lookup-self": tls: failed to verify certificate: x509: certificate relies on legacy Common Name field, use SANs instead
+instances:
+  - name: elasticsearch
+    dns:
+      - elasticsearch
+  - name: kibana
+    dns:
+      - kibana
+      - localhost
+  - name: logstash
+    dns:
+      - logstash
+  - name: vault
+    dns:
+      - vault
+  - name: prom-exporter
+    # Need to put dns names of prometheus exporters into here, else error in prometheus web ui: 
+    # tls: failed to verify certificate: x509: certificate is valid for node-exporter, not SERVICE_NAME
+    dns:
+      - node-exporter
+      - blackbox
+      - grafana
+      - nginx-exporter
+      - logstash-exporter
+      - host.docker.internal
+      - localhost
+  - name: prometheus
+    dns:
+      - prometheus
+      - localhost
+  - name: waf
+    dns:
+      - waf
+      - localhost
+  - name: node
+    dns:
+      - node

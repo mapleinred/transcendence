@@ -1,0 +1,38 @@
+groups:
+  - name: system-health
+    rules:
+    - alert: HighCpuUsage
+      # Alert if cpu usage exceeds 90 percent for 5min
+      expr: 100 - ((avg by(instance) (rate(node_cpu_seconds_total{mode="idle"}[5m]))) * 100) > 1
+      for: 2h
+      keep_firing_for: 2h
+      labels:
+        severity: critical
+      annotations:
+        summary: "High cpu usage at ==> {{ $labels.instance }}"
+        description: "Cpu usage is above 90% for 5mins on {{ $labels.instance }}"
+    - alert: HighRamUsage
+      expr: (avg_over_time(node_memory_MemTotal_bytes[1h]) - avg_over_time(node_memory_MemAvailable_bytes[1h]))
+        / avg_over_time(node_memory_MemTotal_bytes[1h]) * 100 > 1
+#      expr: (node_memory_MemTotal_bytes{instance="host.docker.internal:9101"} - node_memory_Available_bytes{instance="host.docker.internal:9101"})
+#        / node_memory_MemTotal_bytes{instance="host.docker.internal:9101"} * 100 > 0
+      # Without specifying time here, alert doesn't seem to trigger and remains in inactive state (green)
+      for: 5m
+      keep_firing_for: 5m
+      labels:
+        severity: critical
+      annotations:
+        summary: "High ram usage at ==> {{ $labels.instance }}"
+        description: "Ram usage reached over 80%"
+    # /dev/sda is our hard disk
+    - alert: HighDiskspaceUsage
+      expr: (node_filesystem_size_bytes{device="/dev/sda"} - node_filesystem_avail_bytes{device="/dev/sda"})
+        / node_filesystem_size_bytes{device="/dev/sda"} * 100 > 1
+      for: 5m
+      labels:
+        severity: page
+      annotations:
+        summary: "High diskspace usage for /dev/sda"
+        description: "Diskspace usage reached over 80%"
+
+# Reference: https://signoz.io/guides/average-memory-usage-query-prometheus/

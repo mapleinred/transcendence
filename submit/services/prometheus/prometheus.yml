@@ -1,0 +1,140 @@
+# my global config
+global:
+  scrape_interval: 15s # Set the scrape interval to every 15 seconds. Default is every 1 minute.
+  evaluation_interval: 15s # Evaluate rules every 15 seconds. The default is every 1 minute.
+  # scrape_timeout is set to the global default (10s).
+
+# Alertmanager configuration
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets:
+          # - alertmanager:9093
+
+# Load rules once and periodically evaluate them according to the global 'evaluation_interval'.
+rule_files:
+  - "/alerting_rules.yml"
+  # - "first_rules.yml"
+  # - "second_rules.yml"
+
+# A scrape configuration containing exactly one endpoint to scrape:
+# Here it's Prometheus itself.
+scrape_configs:
+  # The job name is added as a label `job=<job_name>` to any timeseries scraped from this config.
+  #- job_name: "prometheus"
+
+  #  # metrics_path defaults to '/metrics'
+  #  # scheme defaults to 'http'.
+
+  #  static_configs:
+  #    - targets: ["localhost:9090"]
+
+
+  # WSL has problems with localhost for some reason, links keeps redirecting to DESKTOP-... ip (in /etc/hosts)
+  # Debian VM redirects to debian (maps to 127.0.1.1 as well in /etc/hosts)
+
+  # Reference: https://prometheus.io/docs/guides/multi-target-exporter/
+  # For prom/blackbox-exporter that allows blackbox probing of endpoints over HTTP, HTTPS, etc
+  #- job_name: blackbox # To get metrics about the exporter itself
+  #  static_configs:
+  #    - targets: 
+  #      - "blackbox:9115"
+
+  # Blackbox not needed for now, can be used to test our nodejs server later?
+  #  - job_name: blackbox-http # To get metrics about the exporter's targets
+  #    metrics_path: /probe
+  #    params:
+  #      module: [http_2xx]
+  #    scheme: https
+  #    # http: TLS handshake error from 172.19.0.7:53432: tls: client didn't provide a certificate
+  #    tls_config:
+  #      cert_file: "certs/prometheus.crt"
+  #      key_file: "certs/prometheus.key"
+  #    static_configs:
+  #      - targets:
+  #        - https://prometheus.io
+  #        - https://example.com:80
+  #    relabel_configs:
+  #      - source_labels: [__address__ ]
+  #        target_label: __param_target
+  #      - source_labels: [__param_target]
+  #        target_label: instance
+  #      - target_label: __address__
+  #        replacement: "blackbox:9115" # Blackbox exporter's real hostname:port
+
+  #  - job_name: cadvisor
+  #    static_configs:
+  #      - targets: ["cadvisor:8080"] # Doesn't support https
+
+  #  - job_name: logstash
+  #    static_configs:
+  #      - targets: ["logstash-exporter:9198"]
+
+  #  - job_name: elasticsearch
+  #    static_configs:
+  #      - targets: ["elasticsearch-exporter:9114"]
+
+  # Takes a long time to show up in Prometheus web ui after enabling cert verification
+  #  - job_name: kibana
+  #    static_configs:
+  #      - targets: ["kibana-exporter:9684"]
+  #  - job_name: sqlite
+  #    static_configs:
+  #      - targets: ["sqlite-exporter:9285"]
+  #
+  #  - job_name: sqlite-exporter
+  #    metrics_path: /database_exporter_metrics
+  #    static_configs:
+  #      - targets: ["sqlite-exporter:9285"]
+
+  - job_name: sqlite-exporter
+    metrics_path: /database_exporter_metrics
+    static_configs:
+      - targets: ["waf:9285"]
+    scheme: https
+    tls_config:
+      ca_file: "/etc/ssl/certs/ca.crt"
+      cert_file: "certs/prometheus.crt"
+      key_file: "certs/prometheus.key"
+
+  - job_name: nginx-proxypass
+    static_configs:
+      - targets: ["waf:9285", "waf:9684", "waf:9114", "waf:8080"]
+    scheme: https
+    tls_config:
+      ca_file: "/etc/ssl/certs/ca.crt"
+      cert_file: "certs/prometheus.crt"
+      key_file: "certs/prometheus.key"
+
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090", "grafana:3000", "host.docker.internal:9101", "nginx-exporter:9113", "node:3001", "logstash-exporter:9198"]
+        #"kibana-exporter:9684"] #, "blackbox:9115"
+    scheme: https
+    tls_config:
+      ca_file: "/etc/ssl/certs/ca.crt"
+      cert_file: "certs/prometheus.crt"
+      key_file: "certs/prometheus.key"
+
+  # Won't be able to display metrics from browser because GET request to vault server requires X-Vault-Token
+  - job_name: vault
+    metrics_path: /v1/sys/metrics
+    params:
+      format: ["prometheus"]
+    scheme: https
+    tls_config:
+      ca_file: "/etc/ssl/certs/ca.crt"
+      cert_file: "certs/prometheus.crt"
+      key_file: "certs/prometheus.key"
+    bearer_token_file: "/run/secrets/prometheus-token"
+    static_configs:
+       - targets: ["vault:8200"]
+
+#    authorization:
+#      credentials_file: /run/secrets/prometheus-token
+
+#remote_write:
+#  - url: http://localhost:3000
+#    basic_auth:
+#      username: admin
+#      password: abc123

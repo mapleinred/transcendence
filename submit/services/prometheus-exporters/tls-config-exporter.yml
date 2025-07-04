@@ -1,0 +1,5 @@
+tls_server_config:
+  cert_file: /certs/prom-exporter.crt
+  key_file: /certs/prom-exporter.key
+  client_ca_file: /etc/ssl/certs/ca.crt
+  client_auth_type: "RequireAndVerifyClientCert"

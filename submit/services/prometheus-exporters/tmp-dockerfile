@@ -1,0 +1,26 @@
+ARG VAULT_ADDR
+ENV VAULT_ADDR=$VAULT_ADDR
+FROM ubuntu:latest AS build
+RUN --mount=type=secret,id=elastic-token \
+    /bin/bash -c 'apt-get update && \
+        apt-get upgrade -y && \
+        apt-get install -y jq curl && \
+        apt-get clean && \
+        curl --cacert /etc/ssl/certs/ca.crt -H "X-Vault-Token: $(cat /run/secrets/elastic-token)" $VAULT_ADDR/v1/kv/elastic-creds > /elastic-password'
+
+#        curl --cacert /etc/ssl/certs/ca.crt -H "X-Vault-Token: $(cat /run/secrets/elastic-token)" $VAULT_ADDR/v1/kv/elastic-creds \
+#        | jq ".data.\"elastic-password\"" \
+#        | tr -d "\"" > /elastic-password'
+
+FROM chamilad/kibana-prometheus-exporter:v8.7.x.2
+STOPSIGNAL SIGKILL
+COPY --from=build /elastic-password /elastic-password
+#ARG ELASTIC_PASS=$(cat /elastic-password; rm -f /elastic-password)
+#RUN --mount=type=bind,from=build,target=/elastic-password,source=/elastic-password \
+#    bin/kibana_exporter -kibana.uri https://kibana:5601 -kibana.username elastic -kibana.password $ELASTIC_PASS -debug -wait
+#ENTRYPOINT ["sleep", "infinity"]
+#CMD ["-kibana.uri", "https://kibana:5601", "-kibana.username", "elastic", "-kibana.password", "$ELASTIC_PASS", "-debug", "-wait"]
+#ENTRYPOINT /bin/sh -c 'export ELASTIC_PASS=$(cat /elastic-password); \
+#    bin/kibana_exporter -kibana.uri https://kibana:5601 -kibana.username elastic -kibana.password $ELASTIC_PASS -debug -wait'
+#ENTRYPOINT /bin/sh -c 'echo -kibana.uri https://kibana:5601 -kibana.username elastic -kibana.password $(cat /elastic-password) -debug -wait | xargs bin/kibana_exporter'
+ENTRYPOINT ["sleep", "infinity"]
